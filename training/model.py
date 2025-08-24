@@ -110,9 +110,8 @@ class ModelArgs:
     beta_fast: int = 32
     beta_slow: int = 1
     mscale: float = 1.
-    # auxiliary-loss-free load balancing
+    # load balancing
     bias_update_speed: float = 0.001
-    load_balance_alpha: float = 0.0001
     # weight initialization
     initializer_range: float = 0.02
     # multi-token prediction
@@ -713,12 +712,11 @@ class Gate(nn.Module):
         self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim, dtype=torch.bfloat16))
         self.bias = nn.Parameter(torch.empty(args.n_routed_experts, dtype=torch.bfloat16)) if self.dim == 7168 else None
         
-        # Add auxiliary-loss-free components
+        # Add bias-based load balancing components
         self.expert_biases = nn.Parameter(torch.zeros(args.n_routed_experts, dtype=torch.bfloat16))
         self.register_buffer("expert_loads", torch.zeros(args.n_routed_experts))
         self.register_buffer("expert_counts", torch.zeros(args.n_routed_experts))
         self.bias_update_speed = args.bias_update_speed
-        self.load_balance_alpha = args.load_balance_alpha
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -780,7 +778,11 @@ class Gate(nn.Module):
             
             # Update running average of loads
             batch_load = counts.float() / (batch_size * indices.size(1))
-            self.expert_loads = 0.9 * self.expert_loads + 0.1 * batch_load
+            # Initialize expert_loads if None or handle first update
+            if self.expert_loads is None:
+                self.expert_loads = batch_load
+            else:
+                self.expert_loads = 0.9 * self.expert_loads + 0.1 * batch_load
             
     def adjust_biases(self):
         """Adjust biases based on expert loads (call at end of training step)"""
@@ -789,11 +791,18 @@ class Gate(nn.Module):
             load_diff = self.expert_loads - target_load
             
             # Decrease bias for overloaded experts, increase for underloaded
-            self.expert_biases.data -= self.bias_update_speed * load_diff
+            # Apply gradient-like update with momentum for stability
+            bias_update = self.bias_update_speed * load_diff
+            self.expert_biases.data -= bias_update
             
-            # Reset counts periodically
+            # Clamp biases to prevent numerical overflow in bfloat16
+            self.expert_biases.data.clamp_(-1e4, 1e4)
+            
+            # Reset counts periodically to adapt to changing data distribution
             if self.expert_counts.sum() > 10000:
                 self.expert_counts.zero_()
+                # Optionally decay biases slightly to allow re-adaptation
+                self.expert_biases.data *= 0.95
 
 
 class Expert(nn.Module):
@@ -864,7 +873,7 @@ class MoE(nn.Module):
                                       for i in range(self.n_routed_experts)])
         self.shared_experts = MLP(args.dim, args.n_shared_experts * args.moe_inter_dim)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass for the MoE module.
 
@@ -872,9 +881,7 @@ class MoE(nn.Module):
             x (torch.Tensor): Input tensor.
 
         Returns:
-            Tuple[torch.Tensor, Optional[torch.Tensor]]: 
-                - Output tensor after expert routing and computation
-                - Optional balance loss (only during training)
+            torch.Tensor: Output tensor after expert routing and computation
         """
         shape = x.size()
         x = x.view(-1, self.dim)
@@ -915,29 +922,11 @@ class MoE(nn.Module):
                 
         z = self.shared_experts(x)
         
-        # Compute sequence-wise balance loss if training
-        balance_loss = None
-        if self.training and hasattr(self.gate, 'load_balance_alpha') and self.gate.load_balance_alpha > 0:
-            # Compute expert load fractions for this sequence
-            seq_len = x.size(0)
-            expert_fractions = counts.float() / (seq_len * self.n_activated_experts)
-            
-            # Compute routing probabilities (average gate scores)
-            routing_probs = torch.zeros(self.n_routed_experts, device=x.device, dtype=weights.dtype)
-            routing_probs.scatter_add_(0, indices.flatten(), 
-                                      weights.flatten().repeat_interleave(1))
-            routing_probs /= seq_len
-            
-            # Balance loss: encourage uniform distribution
-            balance_loss = self.gate.load_balance_alpha * \
-                          (expert_fractions * routing_probs).sum()
-            
-            # Store as detached value for LoadBalanceManager
-            self._last_balance_loss = balance_loss.detach()
+        # Load balancing is handled through expert biases in Gate
         
         if world_size > 1:
             dist.all_reduce(y)
-        return (y + z).view(shape), balance_loss
+        return (y + z).view(shape)
 
 
 class Block(nn.Module):
@@ -978,14 +967,7 @@ class Block(nn.Module):
             torch.Tensor: Output tensor after block computation.
         """
         x = x + self.attn(self.attn_norm(x), start_pos, freqs_cis, mask)
-        
-        # Handle potential balance loss from MoE
-        ffn_output = self.ffn(self.ffn_norm(x))
-        if isinstance(ffn_output, tuple):
-            ffn_output, balance_loss = ffn_output
-            # Balance loss is handled internally by MoE (stored in _last_balance_loss)
-        
-        x = x + ffn_output
+        x = x + self.ffn(self.ffn_norm(x))
         return x
 
 

@@ -13,10 +13,10 @@ import torch
 from torch.optim import Optimizer
 
 try:
-    from .load_balance_manager import LoadBalanceManager
+    from . import moe_utils
 except ImportError:
-    # Handle direct script execution
-    from load_balance_manager import LoadBalanceManager
+    # For standalone testing
+    import moe_utils
 
 
 class DeepSeekV3LRScheduler:
@@ -156,7 +156,6 @@ class DeepSeekV3TrainingScheduler:
     def __init__(self,
                  model,
                  optimizer: Optimizer,
-                 load_balance_manager: LoadBalanceManager,
                  warmup_steps: int = 2000,
                  stable_steps: Optional[int] = None,
                  decay_steps: Optional[int] = None,
@@ -171,7 +170,6 @@ class DeepSeekV3TrainingScheduler:
         Args:
             model: The Transformer model
             optimizer: PyTorch optimizer
-            load_balance_manager: Load balance manager for bias updates
             warmup_steps: LR warmup steps
             stable_steps: Number of steps at peak LR (default: 20% of total)
             decay_steps: Number of decay steps (default: remaining after warmup+stable)
@@ -183,7 +181,6 @@ class DeepSeekV3TrainingScheduler:
         """
         self.model = model
         self.optimizer = optimizer
-        self.load_balance_manager = load_balance_manager
         
         # LR scheduler with warmup + stable + decay
         self.lr_scheduler = DeepSeekV3LRScheduler(
@@ -228,7 +225,7 @@ class DeepSeekV3TrainingScheduler:
         bias_speed = self.initial_bias_speed
         if self.bias_freeze_step is not None and current_step >= self.bias_freeze_step:
             bias_speed = 0.0
-            self.load_balance_manager.set_bias_update_speed(bias_speed)
+            moe_utils.set_bias_update_speed(self.model, bias_speed)
         
         return {
             'lr': lr,
@@ -309,7 +306,6 @@ def get_warmup_stable_decay_lr(step: int,
 def create_scheduler(scheduler_type: str,
                     optimizer: Optimizer,
                     model=None,
-                    load_balance_manager: Optional[LoadBalanceManager] = None,
                     **kwargs) -> DeepSeekV3LRScheduler:
     """
     Factory function to create schedulers.
@@ -318,7 +314,6 @@ def create_scheduler(scheduler_type: str,
         scheduler_type: Type of scheduler ('lr_only' or 'full')
         optimizer: PyTorch optimizer
         model: Model (required for 'full' scheduler)
-        load_balance_manager: Load balance manager (required for 'full' scheduler)
         **kwargs: Additional arguments for scheduler
         
     Returns:
@@ -327,8 +322,8 @@ def create_scheduler(scheduler_type: str,
     if scheduler_type == 'lr_only':
         return DeepSeekV3LRScheduler(optimizer, **kwargs)
     elif scheduler_type == 'full':
-        if model is None or load_balance_manager is None:
-            raise ValueError("Model and load_balance_manager required for full scheduler")
-        return DeepSeekV3TrainingScheduler(model, optimizer, load_balance_manager, **kwargs)
+        if model is None:
+            raise ValueError("Model required for full scheduler")
+        return DeepSeekV3TrainingScheduler(model, optimizer, **kwargs)
     else:
         raise ValueError(f"Unknown scheduler type: {scheduler_type}")

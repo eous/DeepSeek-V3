@@ -118,7 +118,6 @@ def create_model_from_config(config_path: str, checkpoint_path: str = None, devi
         v_head_dim=config.get('v_head_dim', 128),
         mscale=config.get('mscale', 0.707),
         bias_update_speed=config.get('bias_update_speed', 0.001),
-        load_balance_alpha=config.get('load_balance_alpha', 0.0001),
         initializer_range=config.get('initializer_range', 0.02),
         mtp_depth=config.get('mtp_depth', 1),
         mtp_lambda=config.get('mtp_lambda', 0.3),

@@ -101,8 +101,8 @@ if not torch.distributed.is_initialized() or (torch.distributed.is_initialized()
 
 # Import model components
 from model import Transformer, ModelArgs, compute_mtp_loss, set_tensor_parallel_config
-from load_balance_manager import LoadBalanceManager
 from scheduler import DeepSeekV3TrainingScheduler, DeepSeekV3LRScheduler
+import moe_utils
 from dataset import ParquetTextDataset
 from gradient_monitor_tp import GradientMonitorTP
 
@@ -276,7 +276,6 @@ def create_tp_model(config: Dict, tp_config: TPConfig, device_mesh):
         v_head_dim=config.get('v_head_dim', 128),
         mscale=config.get('mscale', 0.707),
         bias_update_speed=config.get('bias_update_speed', 0.001),
-        load_balance_alpha=config.get('load_balance_alpha', 0.0001),
         initializer_range=config.get('initializer_range', 0.02),
         mtp_depth=config.get('mtp_depth', 1),
         mtp_lambda=config.get('mtp_lambda', 0.3),
@@ -520,7 +519,7 @@ class CheckpointManager:
         return checkpoint
 
 
-def resume_training(args, model, optimizer, scheduler=None, balance_manager=None):
+def resume_training(args, model, optimizer, scheduler=None):
     """Resume training from a checkpoint."""
     checkpoint_manager = CheckpointManager(args.save_dir, args.keep_checkpoints)
     
@@ -546,16 +545,6 @@ def resume_training(args, model, optimizer, scheduler=None, balance_manager=None
         if scheduler is not None and 'scheduler_state_dict' in checkpoint:
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             logging.info("Loaded scheduler state")
-        
-        # Load balance manager state if available
-        if balance_manager is not None and 'balance_manager_state_dict' in checkpoint:
-            try:
-                # Balance manager might not have state_dict method
-                if hasattr(balance_manager, 'load_state_dict'):
-                    balance_manager.load_state_dict(checkpoint['balance_manager_state_dict'])
-                    logging.info("Loaded balance manager state")
-            except Exception as e:
-                logging.warning(f"Could not load balance manager state: {e}")
         
         # Get training progress
         global_step = checkpoint.get('global_step', 0)
@@ -747,7 +736,7 @@ def main():
             welcome_text = """
     🚀 [bold cyan]DeepSeek-V3 Training System[/bold cyan] 🚀
     
-    Advanced training with MoE, MLA, and auxiliary-loss-free load balancing
+    Advanced training with MoE, MLA, and bias-based load balancing
             """
             panel = Panel(
                 welcome_text,
@@ -805,7 +794,6 @@ def main():
             "v_head_dim": 128,
             "mscale": 0.707,
             "bias_update_speed": 0.001,
-            "load_balance_alpha": 0.0001,
             "initializer_range": 0.02,
             "mtp_depth": 1,
             "mtp_lambda": 0.3,
@@ -920,7 +908,7 @@ def main():
         This initialization scheme:
         1. Prevents near-zero weights that can get stuck during training
         2. Uses special handling for Gate modules with sigmoid activation
-        3. Handles auxiliary-loss-free components properly
+        3. Initializes expert biases and load tracking properly
         4. Works with both bf16 and fp8 dtypes
         """
         # Standard deviation for initialization
@@ -938,7 +926,7 @@ def main():
         # Import custom classes for isinstance check
         from model import Gate, ParallelEmbedding, Linear
         
-        # Special handling for Gate modules (Phase 1 auxiliary-loss-free)
+        # Special handling for Gate modules with bias-based load balancing
         if isinstance(module, Gate):
             # Gate weight matrix for expert routing
             if hasattr(module, 'weight') and module.weight is not None:
@@ -965,7 +953,7 @@ def main():
             if hasattr(module, 'bias') and module.bias is not None:
                 nn.init.zeros_(module.bias)
             
-            # expert_biases should stay at zero initially (auxiliary-loss-free)
+            # expert_biases start at zero for unbiased initial routing
             if hasattr(module, 'expert_biases') and module.expert_biases is not None:
                 nn.init.zeros_(module.expert_biases)
                 
@@ -1091,12 +1079,10 @@ def main():
         logger.warning(f"Gradient clipping value {args.grad_clip} may be too low for training stability.")
         logger.warning("Consider using --grad-clip 10.0 or higher if you see many gradient clipping warnings.")
     
-    # Create load balance manager if model has MoE layers
-    balance_manager = None
+    # Initialize MoE load balancing if model has routed experts
     if config.get('n_routed_experts', 0) > 0:
-        balance_manager = LoadBalanceManager(model)
-        balance_manager.reset_statistics()
-        logger.info("Load balance manager created for MoE layers")
+        moe_utils.reset_gate_statistics(model)
+        logger.info("Gate statistics initialized for MoE load balancing")
     
     # Create optimizer
     if args.use_8bit_adam:
@@ -1244,12 +1230,11 @@ def main():
     scheduler = None
     stable_steps = int(args.max_steps * 0.1) if args.max_steps else 0
     
-    if balance_manager is not None:
+    if args.n_routed_experts > 0:
         # Use full training scheduler for MoE models
         scheduler = DeepSeekV3TrainingScheduler(
             model=model,
             optimizer=optimizer,
-            load_balance_manager=balance_manager,
             warmup_steps=args.warmup_steps,
             stable_steps=stable_steps,
             peak_lr=args.learning_rate,
@@ -1286,7 +1271,7 @@ def main():
     start_epoch = 0
     global_step = 0
     if args.resume:
-        global_step, start_epoch = resume_training(args, model, optimizer, scheduler, balance_manager)
+        global_step, start_epoch = resume_training(args, model, optimizer, scheduler)
     
     # Training state
     nan_count = 0
@@ -1493,16 +1478,6 @@ def main():
                     # Create zero tensor with same device and dtype
                     mtp_loss = torch.tensor(0.0, device=input_ids.device, dtype=main_loss.dtype, requires_grad=True)
                 
-                # Get balance loss from manager
-                if global_step > 0:  # Only use balance loss after first step
-                    balance_loss = balance_manager.get_balance_loss()
-                    if not isinstance(balance_loss, torch.Tensor):
-                        # Create tensor with same device and dtype
-                        balance_loss = torch.tensor(balance_loss or 0.0, device=input_ids.device, dtype=main_loss.dtype, requires_grad=True)
-                else:
-                    # Create zero tensor with same device and dtype
-                    balance_loss = torch.tensor(0.0, device=input_ids.device, dtype=main_loss.dtype, requires_grad=True)
-                
                 # For DDP, ensure losses are properly reduced across ranks if needed
                 if args.parallel_mode == 'ddp' and world_size > 1:
                     # DDP already averages gradients, but we need to ensure loss values are consistent
@@ -1512,13 +1487,12 @@ def main():
                         mtp_loss = mtp_loss.mean()
                 
                 # Combine losses and scale by gradient accumulation steps
-                total_loss = (main_loss + mtp_loss + balance_loss) / args.gradient_accumulation_steps
+                total_loss = (main_loss + mtp_loss) / args.gradient_accumulation_steps
                 
                 # Debug gradient tracking in DDP
                 if args.parallel_mode == 'ddp' and global_step == 0 and batch_idx == 0:
                     logger.info(f"[DEBUG] main_loss requires_grad: {main_loss.requires_grad}")
                     logger.info(f"[DEBUG] mtp_loss type: {type(mtp_loss)}, requires_grad: {mtp_loss.requires_grad if isinstance(mtp_loss, torch.Tensor) else 'N/A'}")
-                    logger.info(f"[DEBUG] balance_loss type: {type(balance_loss)}, requires_grad: {balance_loss.requires_grad if isinstance(balance_loss, torch.Tensor) else 'N/A'}")
                     logger.info(f"[DEBUG] total_loss requires_grad: {total_loss.requires_grad}")
 
             # Backward pass
@@ -1672,9 +1646,9 @@ def main():
                             else:
                                 param_group['lr'] = current_lr
                 
-                # Balance manager step - update expert biases
-                if balance_manager is not None:
-                    balance_manager.step()
+                # Adjust expert biases based on load statistics
+                if args.n_routed_experts > 0:
+                    moe_utils.adjust_all_gate_biases(model)
                 
                 # Increment global step (only after optimizer step)
                 global_step += 1
@@ -1685,7 +1659,6 @@ def main():
                 outputs = {
                     'loss': main_loss.detach().item(),
                     'aux_loss': mtp_loss.detach().item() if isinstance(mtp_loss, torch.Tensor) else 0.0,
-                    'balance_loss': balance_loss.detach().item() if isinstance(balance_loss, torch.Tensor) else 0.0,
                     'total_loss': total_loss.detach().item() * args.gradient_accumulation_steps  # Unscale for logging
                 }
                 
@@ -1729,10 +1702,6 @@ def main():
                     # Add MoE metrics if available
                     if 'aux_loss' in outputs:
                         metrics['aux_loss'] = outputs['aux_loss']
-                    if 'balance_loss' in outputs:
-                        metrics['balance_loss'] = outputs['balance_loss']
-                    if 'router_z_loss' in outputs:
-                        metrics['router_z_loss'] = outputs['router_z_loss']
                         
                     # Add gradient monitor stats
                     if grad_monitor is not None and 'grad_stats' in locals():
@@ -1842,7 +1811,6 @@ def main():
                         'model_state_dict': model_state_dict,
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                        'balance_manager_state_dict': balance_manager.state_dict() if hasattr(balance_manager, 'state_dict') else None,
                         'global_step': global_step,
                         'epoch': epoch,
                         'config': config,
@@ -1869,12 +1837,12 @@ def main():
         # End of epoch logging
         if rank == 0:
             logger.info(f"Completed epoch {epoch + 1}/{args.num_epochs}")
-            if balance_manager:
-                stats = balance_manager.get_load_balance_stats()
+            if args.n_routed_experts > 0:
+                stats = moe_utils.get_load_balance_metrics(model)
                 logger.info("Load balance statistics:")
-                for layer_name, layer_stats in stats.items():
-                    if 'load_variance' in layer_stats:
-                        logger.info(f"  {layer_name}: Load Var = {layer_stats['load_variance']:.6f}")
+                for gate_name, gate_stats in stats.items():
+                    if 'load_variance' in gate_stats:
+                        logger.info(f"  {gate_name}: Load Var = {gate_stats['load_variance']:.6f}")
     
     # Final JSON log write
     if json_log_path and rank == 0:
@@ -1937,7 +1905,6 @@ def main():
             'model_state_dict': model_state_dict,
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-            'balance_manager_state_dict': balance_manager.state_dict() if hasattr(balance_manager, 'state_dict') else None,
             'global_step': global_step,
             'epoch': epoch if 'epoch' in locals() else 0,
             'config': config,
