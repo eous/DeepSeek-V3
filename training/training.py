@@ -564,6 +564,7 @@ def resume_training(args, model, optimizer, scheduler=None):
 
 
 def main():
+    global sys  # Ensure sys is accessible
     parser = argparse.ArgumentParser(description='DeepSeek-V3 Training with Tensor Parallelism')
     
     # Model configuration arguments
@@ -734,9 +735,9 @@ def main():
         # Display welcome message
         if RICH_AVAILABLE:
             welcome_text = """
-    🚀 [bold cyan]DeepSeek-V3 Training System[/bold cyan] 🚀
+    [bold cyan]DeepSeek-V3 Training System[/bold cyan]
     
-    Advanced training with MoE, MLA, and bias-based load balancing
+    Training with MoE, MLA, and bias-based balancing of experts.
             """
             panel = Panel(
                 welcome_text,

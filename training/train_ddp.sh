@@ -30,7 +30,7 @@ print_debug() {
 }
 
 # Parse arguments
-CONFIG_NAME="${1:-config_8B_v2}"  # Default to 8B v2 config
+CONFIG_NAME="${1:-config_10B}"  # Default to 10B config
 NUM_GPUS=1  # Default to 1 GPU
 PARALLEL_MODE="auto"  # Default to auto mode
 
@@ -74,7 +74,7 @@ NUM_EPOCHS=${NUM_EPOCHS:-1}
 # Auto-calculate max steps if not provided
 if [ -z "$MAX_STEPS" ]; then
     print_info "Auto-calculating max steps based on dataset size..."
-    STEP_INFO=$(python calculate_training_steps.py \
+    STEP_INFO=$(python ./training/calculate_training_steps.py \
         --data-dir "$DATA_DIR" \
         --seq-len $SEQ_LEN \
         --batch-size $BATCH_SIZE \
@@ -160,10 +160,10 @@ if [ "$NUM_GPUS" -gt 1 ]; then
         --nproc_per_node=$NUM_GPUS \
         --standalone \
         --nnodes=1 \
-        training.py"
+        training/training.py"
 else
     print_info "Using single GPU training"
-    CMD="python training.py"
+    CMD="python training/training.py"
 fi
 
 # Add training arguments
