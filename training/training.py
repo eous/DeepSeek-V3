@@ -52,8 +52,6 @@ if _is_rank_zero:
 
 # Now import PyTorch and other libraries
 import torch
-if _is_rank_zero:
-    print("PyTorch version:", torch.__version__)
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
@@ -95,9 +93,7 @@ except ImportError:
     RICH_AVAILABLE = False
     console = None
 
-# Only print on rank 0 or when not in distributed mode
-if not torch.distributed.is_initialized() or (torch.distributed.is_initialized() and torch.distributed.get_rank() == 0):
-    print("Rich UI libraries imported" if RICH_AVAILABLE else "Rich UI libraries not available, using plain text output")
+# Rich UI availability determined above
 
 # Import model components
 from model import Transformer, ModelArgs, compute_mtp_loss, set_tensor_parallel_config
@@ -123,15 +119,43 @@ try:
     HAS_TP = True
 except ImportError:
     HAS_TP = False
-    print("Warning: Tensor parallelism not available. Install PyTorch 2.0+ with distributed support.")
 
-print("PyTorch version:", torch.__version__)
+# PyTorch 2.9 optimizations - Use new API for TF32 settings
+if hasattr(torch.backends.cuda, 'matmul') and hasattr(torch.backends.cuda.matmul, 'fp32_precision'):
+    # New API (PyTorch 2.9+)
+    torch.backends.cuda.matmul.fp32_precision = 'tf32'  # Options: 'ieee', 'tf32', 'ieee_round_even'
+else:
+    # Old API (will be deprecated after PyTorch 2.9)
+    torch.backends.cuda.matmul.allow_tf32 = True
 
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+if hasattr(torch.backends.cudnn, 'conv') and hasattr(torch.backends.cudnn.conv, 'fp32_precision'):
+    # New API (PyTorch 2.9+)
+    torch.backends.cudnn.conv.fp32_precision = 'tf32'  # Options: 'ieee', 'tf32'
+else:
+    # Old API (will be deprecated after PyTorch 2.9)
+    torch.backends.cudnn.allow_tf32 = True
 
-if _is_rank_zero:
-    print("PyTorch backend configured for TF32")
+# Additional PyTorch 2.9 optimizations for CUDA 12.9
+if hasattr(torch.backends.cuda, 'matmul'):
+    # Enable reduced precision reductions for better performance
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+
+# Enable cuDNN benchmark for consistent input sizes
+torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.deterministic = False  # Trade reproducibility for speed
+
+# PyTorch 2.9: Enable flash attention if available
+if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    torch.backends.cuda.enable_math_sdp(True)  # Fallback
+
+# Set CUDA allocator for better memory management
+if hasattr(torch.cuda, 'set_allocator_settings'):
+    torch.cuda.set_allocator_settings("expandable_segments:True")
+
+# PyTorch backend configured with optimizations
 
 @dataclass
 class TPConfig:
@@ -281,7 +305,7 @@ def create_tp_model(config: Dict, tp_config: TPConfig, device_mesh):
         mtp_lambda=config.get('mtp_lambda', 0.3),
         max_seq_len=config.get('max_seq_len', 4096),
         max_batch_size=config.get('max_batch_size', 8),
-        gradient_checkpointing=config.get('gradient_checkpointing', True),
+        gradient_checkpointing=config.get('gradient_checkpointing', False),
         gradient_checkpointing_use_reentrant=config.get('gradient_checkpointing_use_reentrant', False)
     )
     
@@ -773,6 +797,11 @@ def main():
                 logger.error(f"Failed to parse JSON config: {e}")
                 sys.exit(1)
         logger.info(f"Config mtp_depth: {config.get('mtp_depth', 'NOT FOUND')}")
+        
+        # Override config with command line arguments
+        config['gradient_checkpointing'] = args.gradient_checkpointing
+        config['gradient_checkpointing_use_reentrant'] = args.gradient_checkpointing_use_reentrant
+        logger.info(f"Gradient checkpointing set to: {config['gradient_checkpointing']} (from command line)")  
     else:
         # Build config from command line arguments
         logger.info(f"Building model config from arguments: dim={args.dim}, n_heads={args.n_heads}")
@@ -865,7 +894,6 @@ def main():
     
     logger.info(f"Using parallel mode: {args.parallel_mode}")
     
-    # Track model creation time
     model_creation_start = time.time()
     
     # Set default dtype early for model creation
@@ -957,9 +985,6 @@ def main():
             # expert_biases start at zero for unbiased initial routing
             if hasattr(module, 'expert_biases') and module.expert_biases is not None:
                 nn.init.zeros_(module.expert_biases)
-                
-            if rank == 0:  # Only log on main process
-                logger.info(f"  Initialized Gate with {module.score_func} activation (std={gate_std if module.score_func == 'sigmoid' else std})")
         
         # Handle ParallelEmbedding
         elif isinstance(module, ParallelEmbedding):
@@ -1037,7 +1062,6 @@ def main():
         model = model.to(dtype=torch.bfloat16)
     
     # Apply initialization to all modules (now on GPU - much faster!)
-    logger.info("Initializing weights on GPU for faster startup...")
     model.apply(lambda m: init_weights(m, config))
     
     init_time = time.time() - init_start_time
@@ -1075,6 +1099,10 @@ def main():
             logger.warning("Model does not support gradient checkpointing!")
     else:
         logger.info("Gradient checkpointing DISABLED - Using standard forward/backward")
+        # Check if model was created with gradient checkpointing anyway
+        if config.get('gradient_checkpointing', False) and config.get('n_routed_experts', 0) > 0:
+            logger.warning("Model was created with gradient checkpointing=True but training flag is False")
+            logger.warning("MoE bias updates are still in DEFERRED mode and will be applied after backward")
     
     # Log gradient clipping value and provide recommendations
     logger.info(f"Gradient clipping set to: {args.grad_clip}")
@@ -1104,14 +1132,47 @@ def main():
             weight_decay=0.01
         )
     else:
-        # Try to create fused optimizer
-        optimizer = AdamW(model.parameters(),
-                        lr=args.learning_rate,
-                        betas=(0.9, 0.999),
-                        eps=1e-8,
-                        weight_decay=0.01,
-                        fused=True)
-        logger.info("Using fused AdamW optimizer")
+        # Create optimized AdamW with PyTorch 2.9 features
+        try:
+            # Try fused optimizer with capturable for best performance and torch.compile compatibility
+            optimizer = AdamW(model.parameters(),
+                            lr=args.learning_rate,
+                            betas=(0.9, 0.999),
+                            eps=1e-8,
+                            weight_decay=0.01,
+                            fused=True,         # Single CUDA kernel for optimizer step
+                            capturable=True)    # Graph capture for torch.compile
+            logger.info("Using fused AdamW optimizer with capturable=True (PyTorch 2.9 optimizations)")
+        except (TypeError, RuntimeError) as e:
+            # Fallback: try fused without capturable
+            logger.warning(f"Failed to create optimizer with fused=True, capturable=True: {e}")
+            try:
+                optimizer = AdamW(model.parameters(),
+                                lr=args.learning_rate,
+                                betas=(0.9, 0.999),
+                                eps=1e-8,
+                                weight_decay=0.01,
+                                fused=True)
+                logger.info("Using fused AdamW optimizer (capturable not available)")
+            except (TypeError, RuntimeError):
+                # Second fallback: try foreach with capturable
+                try:
+                    optimizer = AdamW(model.parameters(),
+                                    lr=args.learning_rate,
+                                    betas=(0.9, 0.999),
+                                    eps=1e-8,
+                                    weight_decay=0.01,
+                                    foreach=True,
+                                    capturable=True)
+                    logger.info("Using AdamW optimizer with foreach=True (fused not available)")
+                except (TypeError, RuntimeError):
+                    # Final fallback: standard AdamW
+                    optimizer = AdamW(model.parameters(),
+                                    lr=args.learning_rate,
+                                    betas=(0.9, 0.999),
+                                    eps=1e-8,
+                                    weight_decay=0.01)
+                    logger.info("Using standard AdamW optimizer")
 
     # Create gradient monitor with proper model reference
     if args.use_gradient_monitor:
@@ -1135,7 +1196,7 @@ def main():
     else:
         grad_monitor = None
     
-    # Create dataset and Determine data path
+    # Determine data path
     if args.data_path:
         data_paths = [args.data_path]
     else:
@@ -1229,9 +1290,7 @@ def main():
         logger.info(f"Using IterableDataset in DDP mode (rank {rank}/{world_size})")
         logger.info("Files are distributed across ranks for efficient parallel training.")
     
-    # Use the dataloader variable name consistently
     dataset = dataloader
-
     
     # Create scheduler - always use at least LR scheduler for stable training
     scheduler = None
@@ -1317,11 +1376,9 @@ def main():
     logger.info("Starting training...")
     model.train()
     
-    # Debug: Check model parameters require gradients
+    # Verify model has trainable parameters
     actual_model = model.module if hasattr(model, 'module') else model
-    total_params = sum(1 for p in actual_model.parameters())
     trainable_params = sum(1 for p in actual_model.parameters() if p.requires_grad)
-    logger.info(f"Model has {total_params} total parameters, {trainable_params} require gradients")
     if trainable_params == 0:
         logger.error("ERROR: No model parameters require gradients! Training will not work.")
         raise RuntimeError("Model has no trainable parameters")
@@ -1344,7 +1401,6 @@ def main():
             total=args.max_steps
         )
     
-    # Track metrics
     current_lr = args.learning_rate  # Initialize current learning rate
     
     # Timing variables for tokens/sec calculation
@@ -1353,8 +1409,7 @@ def main():
     total_tokens_processed = 0
     last_log_step = global_step
     
-    # Initialize grad_norm to avoid undefined variable in logging
-    grad_norm_value = 0.0
+    grad_norm_value = torch.tensor(0.0, device=f'cuda:{local_rank}')
     
     for epoch in range(start_epoch, args.num_epochs):
         # For IterableDataset with DDP, we rely on random seeds for different data per rank
@@ -1379,90 +1434,26 @@ def main():
             attention_mask = batch.get('attention_mask', torch.ones_like(input_ids)).cuda()
             labels = batch.get('labels', input_ids.clone()).cuda()
             
-            # Debug: Check if any labels are out of vocab range
-            if global_step == 0 and batch_idx == 0:
-                vocab_size = config.get('vocab_size', 128256)
-                max_label = labels.max().item()
-                min_label = labels[labels != -100].min().item() if (labels != -100).any() else -1
-                logger.info(f"[DEBUG] Vocab size: {vocab_size}")
-                logger.info(f"[DEBUG] Labels range: min={min_label}, max={max_label}")
-                logger.info(f"[DEBUG] Input IDs range: min={input_ids.min().item()}, max={input_ids.max().item()}")
-                if max_label >= vocab_size:
-                    logger.error(f"[ERROR] Labels contain values >= vocab_size! max={max_label} >= {vocab_size}")
-                    invalid_mask = labels >= vocab_size
-                    invalid_count = invalid_mask.sum().item()
-                    logger.error(f"[ERROR] Found {invalid_count} invalid labels out of {labels.numel()}")
-            
             # Check if we should zero gradients (first batch in accumulation)
             if batch_idx % args.gradient_accumulation_steps == 0:
                 optimizer.zero_grad(set_to_none=True)
             
-                # Debug model parameters before forward pass
-                if global_step == 0 and batch_idx == 0:
-                    actual_model = model.module if hasattr(model, 'module') else model
-                    param_info = []
-                    for name, param in list(actual_model.named_parameters())[:5]:  # First 5 params
-                        param_info.append(f"{name}: requires_grad={param.requires_grad}, dtype={param.dtype}")
-                    logger.info(f"[DEBUG] First 5 model parameters:\n" + "\n".join(param_info))
-                    
-                    # Check model's actual vocab size
-                    if hasattr(actual_model, 'head'):
-                        head_out_features = actual_model.head.weight.shape[0]
-                        logger.info(f"[DEBUG] Model head output features (vocab size): {head_out_features}")
-                    if hasattr(actual_model, 'embed'):
-                        embed_vocab_size = actual_model.embed.vocab_size
-                        logger.info(f"[DEBUG] Model embedding vocab size: {embed_vocab_size}")            # Ensure gradients are enabled
             torch.set_grad_enabled(True)
             
             # Forward pass with mixed precision (use bfloat16 to match model dtype)
-            # DEBUGGING: Completely disable autocast to see if it's causing gradient issues
-            use_autocast = False  # args.use_amp and global_step > 5
-            if global_step == 0 and batch_idx == 0:
-                logger.info(f"[DEBUG] Autocast is DISABLED for debugging")
-            with torch.amp.autocast('cuda', enabled=use_autocast, dtype=torch.bfloat16):
+            with torch.amp.autocast('cuda', enabled=args.use_amp, dtype=torch.bfloat16):
                 # Forward pass with attention mask for proper padding handling
                 if config.get('mtp_depth', 0) > 0:
                     try:
                         # MTP enabled, return logits and mtp_logits
-                        logger.info("Using MTP (Multi-Task Prediction) for auxiliary loss")
-                        # Handle DDP wrapper
-                        actual_model = model.module if hasattr(model, 'module') else model
-                        if hasattr(actual_model, 'mtp_lambda'):
-                            logger.info(f"Using MTP lambda: {actual_model.mtp_lambda}")
-
                         logits, mtp_logits = model(tokens=input_ids, return_mtp=True, attention_mask=
                                                    attention_mask)
                     except Exception as e:
                         logger.error(f"Forward pass failed at step {global_step}, batch {batch_idx} with error: {e}\n{torch.cuda.memory_allocated() / (1024**3):.2f} GB")
                         raise e
                 else:
-                    # Debug: Check if model call is breaking gradients
-                    if global_step == 0 and batch_idx == 0:
-                        # Check a parameter before and after forward
-                        first_param = next(model.parameters())
-                        logger.info(f"[DEBUG] Before forward: first param requires_grad={first_param.requires_grad}")
-                        logger.info(f"[DEBUG] Before forward: first param is_leaf={first_param.is_leaf}")
-                    
                     logits = model(tokens=input_ids, attention_mask=attention_mask)
                     mtp_logits = None
-                    
-                    if global_step == 0 and batch_idx == 0:
-                        logger.info(f"[DEBUG] After forward: first param requires_grad={first_param.requires_grad}")
-                        logger.info(f"[DEBUG] After forward: logits is_leaf={logits.is_leaf}")
-                        logger.info(f"[DEBUG] After forward: logits grad_fn={logits.grad_fn}")
-                        logger.info(f"[DEBUG] After forward: logits shape={logits.shape}")
-                        logger.info(f"[DEBUG] After forward: world_size={dist.get_world_size() if dist.is_initialized() else 1}")
-                
-                # Debug logits gradient requirement
-                if global_step == 0 and batch_idx < 4:
-                    logger.info(f"[DEBUG] Batch {batch_idx}: logits requires_grad: {logits.requires_grad}")
-                    logger.info(f"[DEBUG] logits dtype: {logits.dtype}")
-                    logger.info(f"[DEBUG] input_ids requires_grad: {input_ids.requires_grad}")
-                    # Check if model is in training mode
-                    actual_model = model.module if hasattr(model, 'module') else model
-                    logger.info(f"[DEBUG] Model training mode: {actual_model.training}")
-                    logger.info(f"[DEBUG] Autocast enabled: {args.use_amp}")
-                    logger.info(f"[DEBUG] torch.is_grad_enabled(): {torch.is_grad_enabled()}")
                 
                 # Calculate main loss
                 main_loss = F.cross_entropy(
@@ -1470,10 +1461,6 @@ def main():
                     labels.reshape(-1),
                     ignore_index=-100   # Ignore padding tokens in loss calculation
                 )
-                
-                # Debug loss gradient requirement
-                if global_step == 0 and batch_idx < 4:
-                    logger.info(f"[DEBUG] Batch {batch_idx}: main_loss requires_grad AFTER computation: {main_loss.requires_grad}")
                 
                 # Calculate MTP loss if enabled
                 if mtp_logits is not None:
@@ -1495,26 +1482,35 @@ def main():
                 
                 # Combine losses and scale by gradient accumulation steps
                 total_loss = (main_loss + mtp_loss) / args.gradient_accumulation_steps
-                
-                # Debug gradient tracking in DDP
-                if args.parallel_mode == 'ddp' and global_step == 0 and batch_idx == 0:
-                    logger.info(f"[DEBUG] main_loss requires_grad: {main_loss.requires_grad}")
-                    logger.info(f"[DEBUG] mtp_loss type: {type(mtp_loss)}, requires_grad: {mtp_loss.requires_grad if isinstance(mtp_loss, torch.Tensor) else 'N/A'}")
-                    logger.info(f"[DEBUG] total_loss requires_grad: {total_loss.requires_grad}")
 
-            # Backward pass
+            # Backward pass with optimized gradient accumulation
             try:
-                total_loss.backward()
+                # Use no_sync() for gradient accumulation to avoid unnecessary gradient syncs
+                if args.gradient_accumulation_steps > 1 and (batch_idx + 1) % args.gradient_accumulation_steps != 0:
+                    # Not the last accumulation step - skip gradient sync
+                    if args.parallel_mode == 'ddp' and hasattr(model, 'no_sync'):
+                        with model.no_sync():
+                            total_loss.backward()
+                    else:
+                        total_loss.backward()
+                else:
+                    # Last accumulation step or no accumulation - sync gradients
+                    total_loss.backward()
             except Exception as e:
                 logger.error(f"Backward pass failed at step {global_step}, batch {batch_idx} with error: {e}")
                 raise e
             
             # Apply deferred MoE bias updates after backward (for gradient checkpointing)
-            if args.gradient_checkpointing and config.get('n_routed_experts', 0) > 0:
+            # Check if model was created with gradient checkpointing (not just args)
+            if config.get('gradient_checkpointing', False) and config.get('n_routed_experts', 0) > 0:
                 actual_model = model.module if hasattr(model, 'module') else model
+                updates_applied = 0
                 for module in actual_model.modules():
                     if hasattr(module, 'apply_pending_updates'):
                         module.apply_pending_updates()
+                        updates_applied += 1
+                if updates_applied > 0 and global_step % 100 == 0:
+                    logger.debug(f"Applied {updates_applied} deferred MoE bias updates at step {global_step}")
             
             # Only step optimizer after accumulating gradients
             if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
@@ -1531,7 +1527,6 @@ def main():
                     current_grad_norm, grad_stats = grad_monitor.clip_and_monitor(
                         max_norm=args.grad_clip,
                     )
-                    # Extract the actual gradient norm value
                     current_grad_norm = grad_stats.get('grad_norm', current_grad_norm)
                 else:
                     # Manual gradient clipping without monitoring
@@ -1541,54 +1536,28 @@ def main():
                     else:
                         clip_model = model
                     
-                    # Debug: manually compute gradient norm before clipping
-                    if global_step < 5:
-                        total_norm = 0.0
-                        param_count = 0
-                        params_without_grad = 0
-                        params_not_requiring_grad = 0
-                        for p in clip_model.parameters():
-                            if not p.requires_grad:
-                                params_not_requiring_grad += 1
-                            elif p.grad is not None:
-                                param_norm = p.grad.data.norm(2)
-                                total_norm += param_norm.item() ** 2
-                                param_count += 1
-                            else:
-                                params_without_grad += 1
-                        total_norm = total_norm ** 0.5
-                        logger.info(f"[DEBUG] Manual grad norm calculation: {total_norm:.6f} from {param_count} params with gradients")
-                        logger.info(f"[DEBUG] Params without grad: {params_without_grad}, Params not requiring grad: {params_not_requiring_grad}")
-                        logger.info(f"[DEBUG] Total params: {sum(1 for _ in clip_model.parameters())}")
+
                     
                     current_grad_norm = torch.nn.utils.clip_grad_norm_(clip_model.parameters(), args.grad_clip)
-                    current_grad_norm = current_grad_norm.item() if isinstance(current_grad_norm, torch.Tensor) else current_grad_norm
                     
-                    # Debug logging for gradient norm
-                    if global_step < 10 or global_step % 100 == 0:
-                        logger.info(f"[DEBUG] Step {global_step}: Pre-sync grad_norm = {current_grad_norm:.6f}")
+                    # Keep grad norm as tensor on GPU
+                    if isinstance(current_grad_norm, torch.Tensor):
+                        grad_norm_tensor = current_grad_norm
+                    else:
+                        grad_norm_tensor = torch.tensor(current_grad_norm, device=f'cuda:{local_rank}')
                     
                     # For DDP with multiple GPUs, we need to ensure gradient norm is computed correctly
                     # DDP already synchronizes gradients, but gradient norm computation happens locally
                     if args.parallel_mode == 'ddp' and world_size > 1:
                         # Compute gradient norm across all ranks
-                        grad_norm_tensor = torch.tensor([current_grad_norm], device=f'cuda:{local_rank}')
                         torch.distributed.all_reduce(grad_norm_tensor, op=torch.distributed.ReduceOp.MAX)
-                        current_grad_norm = grad_norm_tensor.item()
                         
-                        if global_step < 10 or global_step % 100 == 0:
-                            logger.info(f"[DEBUG] Step {global_step}: Post-sync grad_norm = {current_grad_norm:.6f}")
+
                     
                     grad_stats = {'grad_norm': current_grad_norm}
                 
-                # Update the global grad_norm_value for logging
-                grad_norm_value = current_grad_norm
-                
-                # Always log for first few steps to debug
-                if global_step < 10:
-                    logger.info(f"[DEBUG] Step {global_step}: grad_norm_value set to {grad_norm_value:.6f}")
-                    logger.info(f"[DEBUG] batch_idx={batch_idx}, gradient_accumulation_steps={args.gradient_accumulation_steps}")
-                    logger.info(f"[DEBUG] Is optimizer step: {(batch_idx + 1) % args.gradient_accumulation_steps == 0}")
+                # Update the global grad_norm_value for logging (keep as tensor on GPU)
+                grad_norm_value = grad_norm_tensor
                 
                 # Ensure all CUDA operations are complete before optimizer step
                 if torch.cuda.is_available():
@@ -1625,55 +1594,23 @@ def main():
                     
                     if isinstance(scheduler, DeepSeekV3LRScheduler):
                         # LR scheduler returns float and updates optimizer internally
-                        if global_step < 10 and rank == 0:
-                            logger.info(f"[DEBUG] Before scheduler.step(): current_step={scheduler.current_step}, lr={scheduler.get_lr():.6f}")
                         current_lr = scheduler.step()
-                        if global_step < 10 and rank == 0:
-                            logger.info(f"[DEBUG] After scheduler.step(): current_step={scheduler.current_step}, lr={current_lr:.6f}")
                     else:
                         # Training scheduler returns dict
                         scheduler_info = scheduler.step()
                         current_lr = scheduler_info.get('lr', args.learning_rate)
-                    
-                    # For DDP, broadcast the learning rate from rank 0 to ensure consistency
-                    if args.parallel_mode == 'ddp' and world_size > 1:
-                        lr_tensor = torch.tensor([current_lr], dtype=torch.float32, device=f'cuda:{local_rank}')
-                        torch.distributed.broadcast(lr_tensor, src=0)
-                        current_lr = lr_tensor.item()
-                
-                # Verify optimizer LR was updated (for debugging)
-                actual_lr = optimizer.param_groups[0]['lr']
-                if isinstance(actual_lr, torch.Tensor):
-                    actual_lr = actual_lr.item()
-                
-                # Verify LR update was successful
-                if abs(actual_lr - current_lr) > 1e-10:
-                    # With proper synchronization, this should rarely happen
-                    logger.debug(f"LR update verification: scheduler={current_lr:.6e}, optimizer={actual_lr:.6e}, diff={abs(actual_lr - current_lr):.2e}")
-                    
-                    # Only force update if difference is significant
-                    if abs(actual_lr - current_lr) / max(actual_lr, current_lr, 1e-10) > 0.01:  # 1% tolerance
-                        logger.warning(f"Significant LR mismatch: forcing optimizer update")
-                        for param_group in optimizer.param_groups:
-                            if isinstance(param_group['lr'], torch.Tensor):
-                                param_group['lr'].fill_(current_lr)
-                            else:
-                                param_group['lr'] = current_lr
-                
-                # Increment global step (only after optimizer step)
+
                 global_step += 1
             
             # Only process metrics and logging after gradient accumulation
             if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
-                # Create outputs dictionary for logging
-                outputs = {
-                    'loss': main_loss.detach().item(),
-                    'aux_loss': mtp_loss.detach().item() if isinstance(mtp_loss, torch.Tensor) else 0.0,
-                    'total_loss': total_loss.detach().item() * args.gradient_accumulation_steps  # Unscale for logging
-                }
+                # Detach and move to CPU for logging (frees GPU memory)
+                loss_for_logging = main_loss.detach().cpu()
+                mtp_loss_for_logging = mtp_loss.detach().cpu() if isinstance(mtp_loss, torch.Tensor) else torch.tensor(0.0)
+                total_loss_for_logging = (total_loss.detach() * args.gradient_accumulation_steps).cpu()
                 
-                # Check for NaN
-                if torch.isnan(torch.tensor(outputs['loss'])):
+                # Check for NaN on GPU (no CPU sync)
+                if torch.isnan(loss_for_logging):
                     nan_count += 1
                     if rank == 0:
                         logger.warning(f"Step {global_step}: NaN detected! (count: {nan_count}/{max_nan_steps})")
@@ -1695,23 +1632,19 @@ def main():
                 # Logging
                 if global_step % args.log_interval == 0 and rank == 0:
                     # grad_norm_value is already updated from gradient clipping above
-                    # For gradient accumulation steps, we may not have updated grad norm yet
                     is_optimizer_step = (batch_idx + 1) % args.gradient_accumulation_steps == 0
                     
+                    # Build metrics dict - defer .item() calls until actually logging
                     metrics = {
-                        'loss': outputs['loss'],
+                        'loss': loss_for_logging,
                         'learning_rate': current_lr,
-                        'grad_norm': grad_norm_value if is_optimizer_step else grad_norm_value,  # Show last value during accumulation
+                        'grad_norm': grad_norm_value,  # Keep as tensor
                         'global_step': global_step,
                     }
                     
-                    # Debug logging for grad norm issue
-                    if global_step < 10:
-                        logger.info(f"[DEBUG] Metrics at step {global_step}: grad_norm={metrics['grad_norm']:.6f}, is_optimizer_step={is_optimizer_step}")
-                    
-                    # Add MoE metrics if available
-                    if 'aux_loss' in outputs:
-                        metrics['aux_loss'] = outputs['aux_loss']
+                    # Add MTP metrics if available
+                    if mtp_loss_for_logging is not None and mtp_loss_for_logging > 0:
+                        metrics['mtp_loss'] = mtp_loss_for_logging
                         
                     # Add gradient monitor stats
                     if grad_monitor is not None and 'grad_stats' in locals():
@@ -1745,7 +1678,7 @@ def main():
                     # Add timestamp and epoch info
                     metrics['timestamp'] = current_time
                     metrics['epoch'] = epoch + 1
-                    metrics['total_loss'] = outputs.get('total_loss', outputs['loss'])
+                    metrics['total_loss'] = total_loss_for_logging
                     
                     # Add MTP lambda if using MTP
                     # Handle DDP wrapper
@@ -1794,17 +1727,27 @@ def main():
                     
                     # Enhanced logging with rich
                     if RICH_AVAILABLE:
-                        # Create a formatted string with color
+                        # Create a formatted string with color - convert tensors to values
                         log_parts = [f"[bold green]Step {global_step}[/bold green]"]
-                        log_parts.append(f"Loss: [yellow]{metrics['loss']:.4f}[/yellow]")
-                        log_parts.append(f"LR: [cyan]{metrics['learning_rate']:.2e}[/cyan]")
-                        log_parts.append(f"Grad: [magenta]{metrics['grad_norm']:.2f}[/magenta]")
+                        
+                        # Convert tensor metrics to values for display
+                        # loss and mtp_loss are already on CPU, lr and grad_norm might still be on GPU
+                        loss_val = metrics['loss'].item() if isinstance(metrics['loss'], torch.Tensor) else metrics['loss']
+                        lr_val = metrics['learning_rate'].cpu().item() if isinstance(metrics['learning_rate'], torch.Tensor) else metrics['learning_rate']
+                        grad_val = metrics['grad_norm'].cpu().item() if isinstance(metrics['grad_norm'], torch.Tensor) else metrics['grad_norm']
+                        
+                        log_parts.append(f"Loss: [yellow]{loss_val:.4f}[/yellow]")
+                        log_parts.append(f"LR: [cyan]{lr_val:.2e}[/cyan]")
+                        log_parts.append(f"Grad: [magenta]{grad_val:.2f}[/magenta]")
                         
                         if 'tokens/sec' in metrics:
                             log_parts.append(f"Speed: [blue]{metrics['tokens/sec']:,} tok/s[/blue]")
                         
-                        if 'aux_loss' in metrics and metrics['aux_loss'] > 0:
-                            log_parts.append(f"Aux: {metrics['aux_loss']:.4f}")
+                        if 'mtp_loss' in metrics:
+                            # mtp_loss is already on CPU
+                            mtp_val = metrics['mtp_loss'].item() if isinstance(metrics['mtp_loss'], torch.Tensor) else metrics['mtp_loss']
+                            if mtp_val > 0:
+                                log_parts.append(f"MTP: {mtp_val:.4f}")
                         # Calculate time remaining
                         steps_remaining = args.max_steps - global_step
                         if 'tokens/sec' in metrics and metrics['tokens/sec'] > 0:
@@ -1834,9 +1777,17 @@ def main():
                             description=f" | ".join(log_parts),
                         )
                     else:
+                        # Convert tensors to values only when actually logging
+                        log_metrics = {}
+                        for k, v in metrics.items():
+                            if isinstance(v, torch.Tensor):
+                                log_metrics[k] = v.cpu().item()
+                            else:
+                                log_metrics[k] = v
+                        
                         logger.info(f"Step {global_step}: " + 
                                     ", ".join([f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}" 
-                                            for k, v in metrics.items()]))
+                                            for k, v in log_metrics.items()]))
                 
                 # Save checkpoint
                 if global_step % args.save_interval == 0 and rank == 0:
@@ -1852,11 +1803,11 @@ def main():
                         'args': vars(args),
                     }
                     
-                    # Include current metrics for checkpoint selection
+                    # Include current metrics for checkpoint selection (convert to Python values)
                     checkpoint_metrics = {
-                        'loss': outputs['loss'],
-                        'learning_rate': current_lr,
-                        'grad_norm': grad_norm_value if 'grad_norm_value' in locals() else 0.0
+                        'loss': loss_for_logging.item() if isinstance(loss_for_logging, torch.Tensor) else loss_for_logging,
+                        'learning_rate': current_lr.cpu().item() if isinstance(current_lr, torch.Tensor) else current_lr,
+                        'grad_norm': grad_norm_value.cpu().item() if isinstance(grad_norm_value, torch.Tensor) else (grad_norm_value if 'grad_norm_value' in locals() else 0.0)
                     }
                     
                     checkpoint_manager.save_checkpoint(checkpoint_dict, global_step, checkpoint_metrics)
@@ -1886,10 +1837,17 @@ def main():
                     # Show top 3 most used (negative bias) and least used (positive bias) experts
                     biases = stats['biases']
                     sorted_indices = biases.argsort()
-                    logger.info(f"    Most used experts (low bias): {sorted_indices[:3].tolist()} "
-                              f"with biases {biases[sorted_indices[:3]].tolist()}")
-                    logger.info(f"    Least used experts (high bias): {sorted_indices[-3:].tolist()} "
-                              f"with biases {biases[sorted_indices[-3:]].tolist()}")
+                    
+                    # Convert to CPU only for final logging
+                    top_experts = sorted_indices[:3].cpu().numpy()
+                    bottom_experts = sorted_indices[-3:].cpu().numpy()
+                    top_biases = biases[sorted_indices[:3]].cpu().numpy()
+                    bottom_biases = biases[sorted_indices[-3:]].cpu().numpy()
+                    
+                    logger.info(f"    Most used experts (low bias): {top_experts.tolist()} "
+                              f"with biases {top_biases.tolist()}")
+                    logger.info(f"    Least used experts (high bias): {bottom_experts.tolist()} "
+                              f"with biases {bottom_biases.tolist()}")
     
     # Final JSON log write
     if json_log_path and rank == 0:
@@ -1897,8 +1855,8 @@ def main():
             # Add final summary to JSON
             final_summary = {
                 'final_step': global_step,
-                'final_loss': outputs.get('loss', 'N/A') if 'outputs' in locals() else 'N/A',
-                'final_lr': current_lr,
+                'final_loss': loss_for_logging.item() if 'loss_for_logging' in locals() and isinstance(loss_for_logging, torch.Tensor) else 'N/A',
+                'final_lr': current_lr.item() if isinstance(current_lr, torch.Tensor) else current_lr,
                 'total_epochs': epoch + 1 if 'epoch' in locals() else 0,
                 'completed': True
             }
@@ -1959,7 +1917,7 @@ def main():
         }
         
         final_metrics = {
-            'loss': outputs.get('loss', float('inf')) if 'outputs' in locals() else float('inf'),
+            'loss': loss_for_logging.item() if 'loss_for_logging' in locals() and isinstance(loss_for_logging, torch.Tensor) else float('inf'),
             'final': True
         }
         
@@ -1983,7 +1941,10 @@ def main():
         if RICH_AVAILABLE:
             console.print(f"\n[bold green]✅ Training completed successfully![/bold green]")
             console.print(f"Total steps: {global_step}")
-            console.print(f"Final loss: {outputs.get('loss', 'N/A'):.4f}" if 'outputs' in locals() else "")
+            if 'loss_for_logging' in locals() and isinstance(loss_for_logging, torch.Tensor):
+                console.print(f"Final loss: {loss_for_logging.item():.4f}")
+            else:
+                console.print("Final loss: N/A")
         else:
             logger.info("Training completed!")
 
