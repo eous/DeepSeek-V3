@@ -1066,6 +1066,11 @@ def main():
         actual_model = model.module if hasattr(model, 'module') else model
         if hasattr(actual_model, 'gradient_checkpointing_enable'):
             actual_model.gradient_checkpointing_enable(use_reentrant=args.gradient_checkpointing_use_reentrant)
+            
+            # Log deferred bias updates status for MoE
+            if config.get('n_routed_experts', 0) > 0:
+                logger.info("MoE bias updates are in DEFERRED mode due to gradient checkpointing")
+                logger.info("Bias updates will be accumulated during forward and applied after backward pass")
         else:
             logger.warning("Model does not support gradient checkpointing!")
     else:
@@ -1080,10 +1085,11 @@ def main():
         logger.warning(f"Gradient clipping value {args.grad_clip} may be too low for training stability.")
         logger.warning("Consider using --grad-clip 10.0 or higher if you see many gradient clipping warnings.")
     
-    # Initialize MoE load balancing if model has routed experts
+    # Log MoE configuration if model has routed experts
     if config.get('n_routed_experts', 0) > 0:
-        moe_utils.reset_gate_statistics(model)
-        logger.info("Gate statistics initialized for MoE load balancing")
+        # MoE load balancing is handled automatically via learnable expert biases
+        # that are updated during each forward pass
+        logger.info("MoE model initialized with auxiliary-loss-free load balancing")
     
     # Create optimizer
     if args.use_8bit_adam:
@@ -1503,6 +1509,13 @@ def main():
                 logger.error(f"Backward pass failed at step {global_step}, batch {batch_idx} with error: {e}")
                 raise e
             
+            # Apply deferred MoE bias updates after backward (for gradient checkpointing)
+            if args.gradient_checkpointing and config.get('n_routed_experts', 0) > 0:
+                actual_model = model.module if hasattr(model, 'module') else model
+                for module in actual_model.modules():
+                    if hasattr(module, 'apply_pending_updates'):
+                        module.apply_pending_updates()
+            
             # Only step optimizer after accumulating gradients
             if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
                 # Gradient synchronization based on parallel mode
@@ -1647,10 +1660,6 @@ def main():
                             else:
                                 param_group['lr'] = current_lr
                 
-                # Adjust expert biases based on load statistics
-                if args.n_routed_experts > 0:
-                    moe_utils.adjust_all_gate_biases(model)
-                
                 # Increment global step (only after optimizer step)
                 global_step += 1
             
@@ -1743,6 +1752,31 @@ def main():
                     actual_model = model.module if hasattr(model, 'module') else model
                     if hasattr(actual_model, 'mtp_lambda'):
                         metrics['mtp_lambda'] = getattr(actual_model, 'mtp_lambda', config.get('mtp_lambda', 0.3))
+                    
+                    # Add MoE bias statistics if model has routed experts
+                    if config.get('n_routed_experts', 0) > 0:
+                        # Use moe_utils to get bias statistics
+                        bias_summary = moe_utils.get_expert_bias_summary(actual_model)
+                        
+                        # Log detailed bias info every 100 steps
+                        if global_step % 100 == 0 and bias_summary:
+                            logger.info("MoE Expert Bias Statistics:")
+                            for name, stats in bias_summary.items():
+                                logger.info(f"  {name}: "
+                                          f"mean={stats['mean']:.4f}, "
+                                          f"std={stats['std']:.4f}, "
+                                          f"range=[{stats['min']:.4f}, {stats['max']:.4f}]")
+                            
+                            # Also log if biases are growing too large
+                            max_bias_range = max(stats['range'] for stats in bias_summary.values())
+                            if max_bias_range > 5.0:
+                                logger.warning(f"Large bias range detected: {max_bias_range:.2f}. "
+                                             "Consider reducing bias_update_speed.")
+                        
+                        # Add summary to metrics for JSON logging
+                        if bias_summary:
+                            metrics['moe_bias_range'] = max(stats['range'] for stats in bias_summary.values())
+                            metrics['moe_bias_std'] = sum(stats['std'] for stats in bias_summary.values()) / len(bias_summary)
                     
                     # JSON logging
                     if json_log_path:
@@ -1839,11 +1873,23 @@ def main():
         if rank == 0:
             logger.info(f"Completed epoch {epoch + 1}/{args.num_epochs}")
             if args.n_routed_experts > 0:
-                stats = moe_utils.get_load_balance_metrics(model)
-                logger.info("Load balance statistics:")
-                for gate_name, gate_stats in stats.items():
-                    if 'load_variance' in gate_stats:
-                        logger.info(f"  {gate_name}: Load Var = {gate_stats['load_variance']:.6f}")
+                actual_model = model.module if hasattr(model, 'module') else model
+
+                # Detailed bias evolution report
+                logger.info("Expert Bias Evolution:")
+                bias_summary = moe_utils.get_expert_bias_summary(actual_model)
+                for name, stats in bias_summary.items():
+                    logger.info(f"  {name}:")
+                    logger.info(f"    Bias range: [{stats['min']:.4f}, {stats['max']:.4f}]")
+                    logger.info(f"    Bias std: {stats['std']:.4f}")
+                    
+                    # Show top 3 most used (negative bias) and least used (positive bias) experts
+                    biases = stats['biases']
+                    sorted_indices = biases.argsort()
+                    logger.info(f"    Most used experts (low bias): {sorted_indices[:3].tolist()} "
+                              f"with biases {biases[sorted_indices[:3]].tolist()}")
+                    logger.info(f"    Least used experts (high bias): {sorted_indices[-3:].tolist()} "
+                              f"with biases {biases[sorted_indices[-3:]].tolist()}")
     
     # Final JSON log write
     if json_log_path and rank == 0:

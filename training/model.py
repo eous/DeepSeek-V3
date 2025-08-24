@@ -712,11 +712,32 @@ class Gate(nn.Module):
         self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim, dtype=torch.bfloat16))
         self.bias = nn.Parameter(torch.empty(args.n_routed_experts, dtype=torch.bfloat16)) if self.dim == 7168 else None
         
-        # Add bias-based load balancing components
+        # Learnable expert biases for load balancing
         self.expert_biases = nn.Parameter(torch.zeros(args.n_routed_experts, dtype=torch.bfloat16))
-        self.register_buffer("expert_loads", torch.zeros(args.n_routed_experts))
-        self.register_buffer("expert_counts", torch.zeros(args.n_routed_experts))
         self.bias_update_speed = args.bias_update_speed
+        
+        # Only register deferred update buffers if gradient checkpointing is enabled
+        self._defer_bias_updates = args.gradient_checkpointing
+        if args.gradient_checkpointing:
+            # For gradient checkpointing compatibility: accumulate updates, apply later
+            self.register_buffer('pending_bias_updates', torch.zeros_like(self.expert_biases.data))
+            self.register_buffer('update_count', torch.tensor(0, dtype=torch.int32))
+        else:
+            # No need for deferred updates without gradient checkpointing
+            self.pending_bias_updates = None
+            self.update_count = None
+
+    def apply_pending_updates(self):
+        """Apply accumulated bias updates (call after backward pass)."""
+        if self.update_count is not None and self.update_count > 0:
+            with torch.no_grad():
+                # Average the accumulated updates
+                avg_updates = self.pending_bias_updates / self.update_count.float()
+                self.expert_biases.sub_(avg_updates)
+                self.expert_biases.clamp_(-1e4, 1e4)
+                # Reset accumulators
+                self.pending_bias_updates.zero_()
+                self.update_count.zero_()
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -763,46 +784,29 @@ class Gate(nn.Module):
             weights /= weights.sum(dim=-1, keepdim=True)
         weights *= self.route_scale
         
-        # Update load statistics during training
+        # Update expert biases based on current batch routing
         if self.training:
-            self.update_expert_loads(indices, x.size(0))
+            with torch.no_grad():
+                # Calculate expert loads for this batch
+                counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).float()
+                loads = counts / (x.size(0) * self.topk)
+                mean_load = loads.mean()
+                
+                # Calculate bias adjustments
+                load_diff = loads - mean_load
+                bias_updates = self.bias_update_speed * load_diff
+                
+                if self._defer_bias_updates and self.pending_bias_updates is not None:
+                    # Accumulate updates for later (gradient checkpointing mode)
+                    self.pending_bias_updates.add_(bias_updates)
+                    self.update_count.add_(1)
+                else:
+                    # Apply updates immediately (normal mode)
+                    self.expert_biases.sub_(bias_updates)
+                    self.expert_biases.clamp_(-1e4, 1e4)
         
         return weights.type_as(x), indices
-    
-    def update_expert_loads(self, indices: torch.Tensor, batch_size: int):
-        """Update expert load statistics for bias adjustment"""
-        if self.training:
-            # Count expert usage in current batch
-            counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts)
-            self.expert_counts += counts.float()
-            
-            # Update running average of loads
-            batch_load = counts.float() / (batch_size * indices.size(1))
-            # Initialize expert_loads if None or handle first update
-            if self.expert_loads is None:
-                self.expert_loads = batch_load
-            else:
-                self.expert_loads = 0.9 * self.expert_loads + 0.1 * batch_load
-            
-    def adjust_biases(self):
-        """Adjust biases based on expert loads (call at end of training step)"""
-        if self.training:
-            target_load = 1.0 / self.n_routed_experts
-            load_diff = self.expert_loads - target_load
-            
-            # Decrease bias for overloaded experts, increase for underloaded
-            # Apply gradient-like update with momentum for stability
-            bias_update = self.bias_update_speed * load_diff
-            self.expert_biases.data -= bias_update
-            
-            # Clamp biases to prevent numerical overflow in bfloat16
-            self.expert_biases.data.clamp_(-1e4, 1e4)
-            
-            # Reset counts periodically to adapt to changing data distribution
-            if self.expert_counts.sum() > 10000:
-                self.expert_counts.zero_()
-                # Optionally decay biases slightly to allow re-adaptation
-                self.expert_biases.data *= 0.95
+
 
 
 class Expert(nn.Module):
