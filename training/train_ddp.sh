@@ -103,7 +103,7 @@ WARMUP_STEPS=${WARMUP_STEPS:-1000}
 if [ ! -f "$CONFIG_PATH" ]; then
     print_error "Config file not found: $CONFIG_PATH"
     echo "Available configs:"
-    ls configs/inference/config_*.json 2>/dev/null | xargs -n1 basename | sed 's/\.json$//'
+    ls configs/training/config_*.json 2>/dev/null | xargs -n1 basename | sed 's/\.json$//'
     exit 1
 fi
 

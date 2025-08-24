@@ -936,7 +936,7 @@ def main():
         min_magnitude = 1e-5
         
         # Import custom classes for isinstance check
-        from inference.model import Gate, ParallelEmbedding, Linear
+        from model import Gate, ParallelEmbedding, Linear
         
         # Special handling for Gate modules (Phase 1 auxiliary-loss-free)
         if isinstance(module, Gate):
@@ -1177,7 +1177,7 @@ def main():
         logger.info(f"Total parameters: {estimated_params:,}")
 
     # Create dataset from parquet files
-    from inference.dataset import create_dataloader
+    from dataset import create_dataloader
     
     # Adjust num_workers based on system capabilities
     import multiprocessing
